@@ -6,6 +6,7 @@ directory structure (like git's .git/objects/).
 
 import hashlib
 import os
+import tempfile
 from contextlib import suppress
 from pathlib import Path
 
@@ -67,15 +68,19 @@ class ObjectStore:
         """
         obj_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Write to a temporary file first, then rename for atomicity
-        tmp_path = obj_path.with_suffix(".tmp")
+        # Write to a temporary file first, then rename for atomicity. Each writer
+        # gets its own temp name: two programs saving identical content at the
+        # same moment used to share "<hash>.tmp", and the second rename failed.
+        fd, tmp_name = tempfile.mkstemp(dir=obj_path.parent, prefix=obj_path.name, suffix=".tmp")
+        tmp_path = Path(tmp_name)
         try:
-            with open(tmp_path, "wb") as f:
+            with os.fdopen(fd, "wb") as f:
                 f.write(data)
                 f.flush()
                 os.fsync(f.fileno())
-            # Atomic rename (on same filesystem)
-            tmp_path.rename(obj_path)
+            # Atomic rename (on same filesystem). If another writer stored the
+            # same object first, this replaces it with identical bytes.
+            os.replace(tmp_path, obj_path)
         except BaseException:
             # Clean up temp file on any failure
             tmp_path.unlink(missing_ok=True)

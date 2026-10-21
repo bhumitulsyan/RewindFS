@@ -151,6 +151,14 @@ def mount(
         trio.run(_run_fuse, storage_path, mount_path, debug)
     except KeyboardInterrupt:
         console.print("\n[yellow]Caught interrupt, unmounting...[/yellow]")
+    except BaseExceptionGroup as group:
+        # Trio wraps Ctrl+C from the FUSE worker tasks in an exception group,
+        # which printed a long traceback on every normal unmount. Treat it like
+        # a plain Ctrl+C; re-raise anything else.
+        _, rest = group.split(KeyboardInterrupt)
+        if rest is not None:
+            raise rest from None
+        console.print("\n[yellow]Caught interrupt, unmounting...[/yellow]")
     finally:
         _release_lock(lock_fd)
         console.print("[green]RewindFS unmounted.[/green]")

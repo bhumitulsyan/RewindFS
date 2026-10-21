@@ -9,7 +9,7 @@ import logging
 import os
 import stat
 import threading
-import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pyfuse3
@@ -137,6 +137,27 @@ class RewindFS(pyfuse3.Operations):
         self._inode_size_cache[inode] = size
         return obj_hash, size
 
+    @staticmethod
+    def _stored_time(row, column: str, fallback: int | None = None) -> int:
+        """A file time in ns from its database row.
+
+        Storage created before times were stored has no value: use the row's
+        last-updated timestamp instead, which is stable across calls.
+        """
+        keys = row.keys()
+        if column in keys and row[column] is not None:
+            return int(row[column])
+        if fallback is not None:
+            return fallback
+        text = row["updated_at"] if "updated_at" in keys else None
+        if text:
+            try:
+                parsed = datetime.fromisoformat(text).replace(tzinfo=UTC)
+                return int(parsed.timestamp() * 1_000_000_000)
+            except ValueError:
+                pass
+        return 0
+
     def _make_entry(self, row) -> pyfuse3.EntryAttributes:
         entry = pyfuse3.EntryAttributes()
         entry.st_ino = row["id"]
@@ -171,10 +192,13 @@ class RewindFS(pyfuse3.Operations):
             else:
                 entry.st_size = 0
 
-        now_ns = int(time.time() * 1e9)
-        entry.st_atime_ns = now_ns
-        entry.st_mtime_ns = now_ns
-        entry.st_ctime_ns = now_ns
+        # Real, stored times. They used to be "now" on every call, so editors
+        # such as vim saw the file change between reading and saving it and
+        # refused to save; `ls -l` and `touch -d` were wrong too.
+        mtime = self._stored_time(row, "mtime_ns")
+        entry.st_mtime_ns = mtime
+        entry.st_atime_ns = self._stored_time(row, "atime_ns", mtime)
+        entry.st_ctime_ns = self._stored_time(row, "ctime_ns", mtime)
         entry.st_blksize = 4096
         entry.st_blocks = (entry.st_size + 511) // 512
         return entry
@@ -213,6 +237,11 @@ class RewindFS(pyfuse3.Operations):
 
         if mode is not None or uid is not None or gid is not None:
             self.db.update_attrs(inode, mode=mode, uid=uid, gid=gid)
+
+        atime = attr.st_atime_ns if getattr(fields, "update_atime", False) else None
+        mtime = attr.st_mtime_ns if getattr(fields, "update_mtime", False) else None
+        if atime is not None or mtime is not None:
+            self.db.set_times(inode, atime_ns=atime, mtime_ns=mtime)
 
         if fields.update_size:
             lock = self._get_inode_lock(inode)

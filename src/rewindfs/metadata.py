@@ -5,7 +5,10 @@ Uses synchronous sqlite3 — pyfuse3 runs on Trio, and SQLite on local disk
 is fast enough that thread offloading is only needed for bulk operations.
 """
 
+import functools
 import sqlite3
+import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -124,6 +127,10 @@ ADDED_COLUMNS = (
     ("versions", "process_id", "INTEGER REFERENCES processes(id)"),
     ("events", "process_id", "INTEGER REFERENCES processes(id)"),
     ("events", "old_path", "TEXT"),
+    # File times in nanoseconds since 1970 (what `ls -l` and `stat` show)
+    ("files", "mtime_ns", "INTEGER"),
+    ("files", "atime_ns", "INTEGER"),
+    ("files", "ctime_ns", "INTEGER"),
 )
 
 ADDED_INDEXES_SQL = """
@@ -142,6 +149,13 @@ class MetadataDB:
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
+        # One connection is shared by the filesystem's main thread and its
+        # worker threads. Every method holds this lock, so only one thread uses
+        # the connection at a time. Without it the two threads deadlocked: a
+        # worker held SQLite's lock while waiting for Python's lock (to run
+        # tv_now()), and the main thread held Python's lock while waiting for
+        # SQLite's. Waiting on this lock releases Python's lock, so that can't happen.
+        self._lock = threading.RLock()
         self.db: sqlite3.Connection | None = None
         self._manual_tx = False
 
@@ -302,9 +316,9 @@ class MetadataDB:
         assert self.db is not None
         cursor = self.db.execute(
             """INSERT INTO files (parent_id, name, path, is_dir, mode, uid, gid,
-                                   created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, tv_now(), tv_now())""",
-            (parent_id, name, path, is_dir, mode, uid, gid),
+                                   created_at, updated_at, mtime_ns, atime_ns, ctime_ns)
+               VALUES (?, ?, ?, ?, ?, ?, ?, tv_now(), tv_now(), ?, ?, ?)""",
+            (parent_id, name, path, is_dir, mode, uid, gid, *([time.time_ns()] * 3)),
         )
         self.db.commit()
         assert cursor.lastrowid is not None
@@ -383,26 +397,42 @@ class MetadataDB:
         assert self.db is not None
         if mode is not None:
             self.db.execute(
-                "UPDATE files SET mode = ?, updated_at = tv_now() WHERE id = ?",
-                (mode, inode),
+                "UPDATE files SET mode = ?, updated_at = tv_now(), ctime_ns = ? WHERE id = ?",
+                (mode, time.time_ns(), inode),
             )
         if uid is not None:
             self.db.execute(
-                "UPDATE files SET uid = ?, updated_at = tv_now() WHERE id = ?",
-                (uid, inode),
+                "UPDATE files SET uid = ?, updated_at = tv_now(), ctime_ns = ? WHERE id = ?",
+                (uid, time.time_ns(), inode),
             )
         if gid is not None:
             self.db.execute(
-                "UPDATE files SET gid = ?, updated_at = tv_now() WHERE id = ?",
-                (gid, inode),
+                "UPDATE files SET gid = ?, updated_at = tv_now(), ctime_ns = ? WHERE id = ?",
+                (gid, time.time_ns(), inode),
             )
         self.db.commit()
+
+    def set_times(
+        self, inode: int, *, atime_ns: int | None = None, mtime_ns: int | None = None
+    ) -> None:
+        """Set access/modification times (e.g. `touch -d`); also bumps ctime."""
+        assert self.db is not None
+        if atime_ns is not None:
+            self.db.execute("UPDATE files SET atime_ns = ? WHERE id = ?", (atime_ns, inode))
+        if mtime_ns is not None:
+            self.db.execute("UPDATE files SET mtime_ns = ? WHERE id = ?", (mtime_ns, inode))
+        self.db.execute(
+            "UPDATE files SET ctime_ns = ?, updated_at = tv_now() WHERE id = ?",
+            (time.time_ns(), inode),
+        )
+        self._commit_if_needed()
 
     def set_current_version(self, inode: int, version_id: int) -> None:
         assert self.db is not None
         self.db.execute(
-            "UPDATE files SET current_version_id = ?, updated_at = tv_now() WHERE id = ?",
-            (version_id, inode),
+            """UPDATE files SET current_version_id = ?, updated_at = tv_now(),
+                   mtime_ns = ?, ctime_ns = ? WHERE id = ?""",
+            (version_id, time.time_ns(), time.time_ns(), inode),
         )
         self.db.commit()
 
@@ -433,8 +463,9 @@ class MetadataDB:
         version_id = cursor.lastrowid
         assert version_id is not None
         self.db.execute(
-            "UPDATE files SET current_version_id = ?, updated_at = tv_now() WHERE id = ?",
-            (version_id, file_id),
+            """UPDATE files SET current_version_id = ?, updated_at = tv_now(),
+                   mtime_ns = ?, ctime_ns = ? WHERE id = ?""",
+            (version_id, time.time_ns(), time.time_ns(), file_id),
         )
         file_row = self.get_file(file_id)
         path = file_row["path"] if file_row is not None else None
@@ -847,3 +878,17 @@ class MetadataDB:
         stats["orphaned_objects"] = row["c"] if row else 0
 
         return stats
+
+
+def _locked(fn):  # type: ignore[no-untyped-def]
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        with self._lock:
+            return fn(self, *args, **kwargs)
+
+    return wrapper
+
+
+for _name, _member in list(vars(MetadataDB).items()):
+    if callable(_member) and _name != "__init__":
+        setattr(MetadataDB, _name, _locked(_member))
