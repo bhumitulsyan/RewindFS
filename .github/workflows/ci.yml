@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    name: Tests (Python 3.11)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev pkg-config build-essential python3-dev
+
+      - name: Install project deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/unit tests/integration tests/stress \
+            --cov=src/rewindfs \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=75
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+
+  static-analysis:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev pkg-config build-essential python3-dev
+
+      - name: Install project deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: MyPy
+        run: mypy src tests --ignore-missing-imports
+
+  windows-smoke:
+    name: Windows Smoke
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install project deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: CLI help works on Windows
+        run: rewindfs --help
+
+      - name: Mount command reports Linux-only
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force C:\temp\rewindfs-storage | Out-Null
+          New-Item -ItemType Directory -Force C:\temp\rewindfs-mnt | Out-Null
+          $stdout = Join-Path $env:RUNNER_TEMP "rewindfs-mount-out.txt"
+          $stderr = Join-Path $env:RUNNER_TEMP "rewindfs-mount-err.txt"
+          $proc = Start-Process `
+            -FilePath "rewindfs" `
+            -ArgumentList @("mount", "C:\temp\rewindfs-storage", "C:\temp\rewindfs-mnt") `
+            -Wait `
+            -PassThru `
+            -NoNewWindow `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr
+          Get-Content $stdout -ErrorAction SilentlyContinue | Write-Host
+          Get-Content $stderr -ErrorAction SilentlyContinue | Write-Host
+          if ($proc.ExitCode -eq 0) {
+            throw "Expected non-zero exit code for mount on Windows"
+          }
