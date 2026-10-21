@@ -141,8 +141,12 @@ class RewindFS(pyfuse3.Operations):
         entry = pyfuse3.EntryAttributes()
         entry.st_ino = row["id"]
         entry.generation = 0
-        entry.entry_timeout = 1
-        entry.attr_timeout = 1
+        # Don't let the kernel cache names or sizes: restores and snapshot restores
+        # change files from outside this process (the CLI writes the database
+        # directly), and a cached size made `cat` show a cut-off file right after
+        # restoring a longer version.
+        entry.entry_timeout = 0
+        entry.attr_timeout = 0
 
         is_dir = row["is_dir"]
         entry.st_mode = row["mode"]
@@ -281,8 +285,9 @@ class RewindFS(pyfuse3.Operations):
 
         fi = pyfuse3.FileInfo()
         fi.fh = fh
-        # A truncated file's old pages in the kernel cache are no longer valid.
-        fi.keep_cache = not (flags & os.O_TRUNC)
+        # Never reuse cached pages from an earlier open: the file may have been
+        # restored to another version in the meantime.
+        fi.keep_cache = False
         return fi
 
     async def create(self, parent_inode, name, mode, flags, ctx):
@@ -320,7 +325,7 @@ class RewindFS(pyfuse3.Operations):
 
         fi = pyfuse3.FileInfo()
         fi.fh = fh
-        fi.keep_cache = True
+        fi.keep_cache = False
 
         row = self.db.get_file(inode)
         entry = self._make_entry(row)
